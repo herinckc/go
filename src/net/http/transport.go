@@ -280,6 +280,11 @@ type Transport struct {
 	// To use a custom dialer or TLS config and still attempt HTTP/2
 	// upgrades, set this to true.
 	ForceAttemptHTTP2 bool
+
+	// Keep-alive connections are closed after this duration.
+	//
+	// By default connection duration is unlimited.
+	MaxConnDuration time.Duration
 }
 
 // A cancelKey is the key of the reqCanceler map.
@@ -319,6 +324,7 @@ func (t *Transport) Clone() *Transport {
 		MaxIdleConnsPerHost:    t.MaxIdleConnsPerHost,
 		MaxConnsPerHost:        t.MaxConnsPerHost,
 		IdleConnTimeout:        t.IdleConnTimeout,
+		MaxConnDuration:        t.MaxConnDuration,
 		ResponseHeaderTimeout:  t.ResponseHeaderTimeout,
 		ExpectContinueTimeout:  t.ExpectContinueTimeout,
 		ProxyConnectHeader:     t.ProxyConnectHeader.Clone(),
@@ -849,14 +855,15 @@ func (cm *connectMethod) proxyAuth() string {
 
 // error values for debugging and testing, not seen by users.
 var (
-	errKeepAlivesDisabled = errors.New("http: putIdleConn: keep alives disabled")
-	errConnBroken         = errors.New("http: putIdleConn: connection is in bad state")
-	errCloseIdle          = errors.New("http: putIdleConn: CloseIdleConnections was called")
-	errTooManyIdle        = errors.New("http: putIdleConn: too many idle connections")
-	errTooManyIdleHost    = errors.New("http: putIdleConn: too many idle connections for host")
-	errCloseIdleConns     = errors.New("http: CloseIdleConnections called")
-	errReadLoopExiting    = errors.New("http: persistConn.readLoop exiting")
-	errIdleConnTimeout    = errors.New("http: idle connection timeout")
+	errKeepAlivesDisabled          = errors.New("http: putIdleConn: keep alives disabled")
+	errConnBroken                  = errors.New("http: putIdleConn: connection is in bad state")
+	errCloseIdle                   = errors.New("http: putIdleConn: CloseIdleConnections was called")
+	errTooManyIdle                 = errors.New("http: putIdleConn: too many idle connections")
+	errTooManyIdleHost             = errors.New("http: putIdleConn: too many idle connections for host")
+	errCloseIdleConns              = errors.New("http: CloseIdleConnections called")
+	errReadLoopExiting             = errors.New("http: persistConn.readLoop exiting")
+	errIdleConnTimeout             = errors.New("http: idle connection timeout")
+	errMaximumConnDurationExceeded = errors.New("http: maximum connection duration exceeded")
 
 	// errServerClosedIdle is not seen by users for idempotent requests, but may be
 	// seen by a user if the server shuts down an idle connection and sends its FIN
@@ -907,6 +914,9 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 	}
 	if pconn.isBroken() {
 		return errConnBroken
+	}
+	if !pconn.connExpirationTime.IsZero() && time.Now().After(pconn.connExpirationTime) {
+		return errMaximumConnDurationExceeded
 	}
 	pconn.markReused()
 
@@ -1740,6 +1750,10 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 	pconn.br = bufio.NewReaderSize(pconn, t.readBufferSize())
 	pconn.bw = bufio.NewWriterSize(persistConnWriter{pconn}, t.writeBufferSize())
 
+	if t.MaxConnDuration > 0 {
+		pconn.connExpirationTime = time.Now().Add(t.MaxConnDuration)
+	}
+
 	go pconn.readLoop()
 	go pconn.writeLoop()
 	return pconn, nil
@@ -1892,6 +1906,8 @@ type persistConn struct {
 	// Both guarded by Transport.idleMu:
 	idleAt    time.Time   // time it last become idle
 	idleTimer *time.Timer // holding an AfterFunc to close it
+
+	connExpirationTime time.Time // time at which the connection should be removed
 
 	mu                   sync.Mutex // guards following fields
 	numExpectedResponses int

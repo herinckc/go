@@ -6742,6 +6742,9 @@ type http2ClientConn struct {
 	idleTimeout time.Duration // or 0 for never
 	idleTimer   *time.Timer
 
+	maxConnDuration      time.Duration // or 0 for never
+	maxConnDurationTimer *time.Timer
+
 	mu              sync.Mutex // guards following
 	cond            *sync.Cond // hold mu; broadcast on flow/closed changes
 	flow            http2flow  // our conn-level flow control quota (cs.flow is per stream)
@@ -7158,6 +7161,14 @@ func (t *http2Transport) newClientConn(c net.Conn, singleUse bool) (*http2Client
 	if d := t.idleConnTimeout(); d != 0 {
 		cc.idleTimeout = d
 		cc.idleTimer = time.AfterFunc(d, cc.onIdleTimeout)
+	}
+	if mcd := t.maxConnDuration(); mcd != 0 {
+		cc.maxConnDuration = mcd
+		cc.maxConnDurationTimer = time.AfterFunc(mcd, func() {
+			// gracefully shut the connection down with no chance for context cancellation once the
+			// connection's maximum duration has been reached
+			cc.Shutdown(context.Background())
+		})
 	}
 	if http2VerboseLogs {
 		t.vlogf("http2: Transport creating client conn %p to %v", cc, c.RemoteAddr())
@@ -9204,6 +9215,13 @@ func (rt http2noDialH2RoundTripper) RoundTrip(req *Request) (*Response, error) {
 func (t *http2Transport) idleConnTimeout() time.Duration {
 	if t.t1 != nil {
 		return t.t1.IdleConnTimeout
+	}
+	return 0
+}
+
+func (t *http2Transport) maxConnDuration() time.Duration {
+	if t.t1 != nil {
+		return t.t1.MaxConnDuration
 	}
 	return 0
 }
